@@ -1,6 +1,9 @@
 # PKI Secure Logging (Prototype)
 
-## Run
+Secure logging pipeline prototype: agent → server → append-only storage.
+(Upcoming phases: hash chaining, signatures, encryption, PKI, Noise, Docker/K8s.)
+
+## Run locally (PowerShell)
 
 ### Server
 ```powershell
