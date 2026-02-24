@@ -18,3 +18,5 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+#to ignore keys in git
+keys/*_private.pem
