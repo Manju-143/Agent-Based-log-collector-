@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 import asyncio
 import base64
 import json
 import os
+from typing import Dict, Any
 
 from pksl.config import AgentConfig
 from pksl.models import Envelope, LogRecord
@@ -22,9 +21,15 @@ from pksl.crypto.signing import load_private_key_pem, sign_bytes
 from pksl.crypto.key_loader import load_aes_key
 from pksl.crypto.aead import encrypt_aesgcm
 
+from pksl.crypto.pki import load_cert  # must exist in your pksl/crypto/pki.py
+from cryptography.hazmat.primitives import serialization
+
 from agent.state_store import load_state, save_state, AgentState
 
 
+# -----------------------------
+# Demo log generator
+# -----------------------------
 def make_record(i: int) -> LogRecord:
     return LogRecord(
         timestamp=utc_now_iso(),
@@ -35,6 +40,9 @@ def make_record(i: int) -> LogRecord:
     )
 
 
+# -----------------------------
+# Paths / helpers
+# -----------------------------
 def state_path_for(agent_id: str) -> str:
     os.makedirs("./data", exist_ok=True)
     return os.path.join("./data", f"agent_state_{agent_id}.json")
@@ -48,6 +56,17 @@ def noise_static_private_path_for(agent_id: str) -> str:
     return os.path.join("keys", f"{agent_id}_noise_private.key")
 
 
+def load_agent_cert_b64() -> str:
+    """
+    Loads agent X.509 certificate (PEM) and base64 encodes it so it can be sent
+    in the session_hello. Server can validate chain + CRL.
+    """
+    cert_path = os.getenv("PKSL_AGENT_CERT", "pki/issued/agent-01_cert.pem")
+    cert = load_cert(cert_path)
+    pem = cert.public_bytes(serialization.Encoding.PEM)
+    return base64.b64encode(pem).decode("ascii")
+
+
 def signing_message_with_record_fields(
     *,
     version: int,
@@ -56,9 +75,9 @@ def signing_message_with_record_fields(
     prev_hash: str,
     hash_hex: str,
     session_id: str,
-    record_dict: dict,
+    record_dict: Dict[str, Any],
 ) -> bytes:
-    # Channel binding: session_id is included in the signed material
+    # Channel binding: session_id is included in signed material.
     to_sign = {
         "v": version,
         "agent_id": agent_id,
@@ -71,6 +90,9 @@ def signing_message_with_record_fields(
     return canonical_json(to_sign)
 
 
+# -----------------------------
+# Main
+# -----------------------------
 async def main() -> None:
     cfg = AgentConfig.from_env()
 
@@ -91,10 +113,13 @@ async def main() -> None:
     # Load AES key for payload encryption
     aes_key = load_aes_key()
 
+    # Load agent cert (for PKI identity)
+    agent_cert_b64 = load_agent_cert_b64()
+
     i = 0
     print(
         f"[agent] id={cfg.agent_id} -> {cfg.target_host}:{cfg.target_port} | "
-        f"state={spath} | start_seq={seq} | enc=aes-256-gcm | transport=Noise_XX(auth+bound)"
+        f"state={spath} | start_seq={seq} | enc=aes-256-gcm | transport=Noise_XX(auth+bound+pki)"
     )
 
     while True:
@@ -108,14 +133,20 @@ async def main() -> None:
                 static_private_key_path=noise_static_private_path_for(cfg.agent_id),
             )
 
-            # Channel binding: generate a per-connection session_id and send it
+            # Per-connection session_id (channel binding)
             session_nonce = os.urandom(32)
             session_id = base64.b64encode(session_nonce).decode("ascii")
 
-            hello = json.dumps({"type": "session_hello", "session_id": session_id}).encode("utf-8")
+            # Send session hello: includes session_id and agent certificate (base64 PEM)
+            hello_obj = {
+                "type": "session_hello",
+                "session_id": session_id,
+                "agent_id": cfg.agent_id,
+                "agent_cert_b64": agent_cert_b64,
+            }
+            hello = json.dumps(hello_obj).encode("utf-8")
             await send_frame(writer, noise_encrypt(noise, hello))
-
-            print("[agent] noise handshake finished | session_hello sent")
+            print("[agent] noise handshake finished | session_hello sent (with cert)")
 
             while True:
                 seq += 1
@@ -134,14 +165,14 @@ async def main() -> None:
                     version=1,
                 )
 
-                # AES-GCM encrypt the record
+                # AES-GCM encrypt the record (record stays confidential)
                 plaintext = canonical_json(record_dict)
                 aad = canonical_json(
                     {"agent_id": cfg.agent_id, "seq": seq, "prev_hash": ph, "hash": h, "v": 1}
                 )
                 enc = encrypt_aesgcm(aes_key, plaintext, aad)
 
-                # Build envelope WITHOUT plaintext record
+                # Envelope carries ciphertext + chain metadata (no plaintext record)
                 env = Envelope(
                     agent_id=cfg.agent_id,
                     seq=seq,
@@ -154,7 +185,7 @@ async def main() -> None:
                 env.nonce = enc.nonce_b64
                 env.ciphertext = enc.ciphertext_b64
 
-                # Signature over plaintext semantic fields + session binding
+                # Signature binds record semantics + session_id (prevents replay across sessions)
                 env.sig_alg = "ed25519"
                 env.key_id = cfg.agent_id
                 env.signature = sign_bytes(
@@ -170,9 +201,8 @@ async def main() -> None:
                     ),
                 )
 
+                # Serialize and send (Noise encrypt full envelope)
                 payload = env.model_dump_json().encode("utf-8")
-
-                # Noise encrypt the whole envelope for transport
                 wire = noise_encrypt(noise, payload)
                 await send_frame(writer, wire)
 
@@ -183,9 +213,10 @@ async def main() -> None:
 
                 print(f"[agent] sent seq={seq} ack={ack}")
 
-                # Persist state after successful ack
-                prev_hash = h
-                save_state(spath, AgentState(seq=seq, prev_hash=prev_hash))
+                # Persist state only when server accepted
+                if ack.get("ok") is True:
+                    prev_hash = h
+                    save_state(spath, AgentState(seq=seq, prev_hash=prev_hash))
 
                 await asyncio.sleep(cfg.send_interval_sec)
 

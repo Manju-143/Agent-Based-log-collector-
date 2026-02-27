@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -21,6 +19,13 @@ from pksl.transport.noise_xx import (
     noise_decrypt,
 )
 
+#from pksl.crypto.pki import (
+ #   load_cert_from_b64_pem,
+  #  validate_cert_path,
+    #cert_fingerprint_hex,
+    #cert_subject_cn,
+#)
+from pksl.crypto.pki import load_cert_from_b64_pem, validate_cert, cert_fingerprint_hex, cert_subject_cn
 from server.state_store import ServerState, load_server_state, save_server_state
 
 
@@ -84,7 +89,26 @@ async def handle_client(
         if hello.get("type") != "session_hello" or not hello.get("session_id"):
             raise ValueError("Missing/invalid session_hello for channel binding")
 
-        expected_session_id = hello["session_id"]
+        expected_session_id = str(hello["session_id"])
+
+        # --- PKI: validate agent certificate from hello (NO hello-ack sent; keep agent compatible) ---
+        agent_id_from_hello = str(hello.get("agent_id", ""))
+        agent_cert_b64 = str(hello.get("agent_cert_b64", ""))
+
+        if not agent_id_from_hello:
+            raise ValueError("session_hello missing agent_id")
+        if not agent_cert_b64:
+            raise ValueError("session_hello missing agent_cert_b64")
+
+        agent_cert = load_cert_from_b64_pem(agent_cert_b64)
+        validate_cert(agent_cert)
+
+        # Bind identity: require CN == agent_id (recommended for coursework clarity)
+        cn = cert_subject_cn(agent_cert)
+        if cn and cn != agent_id_from_hello:
+            raise ValueError(f"Certificate CN mismatch: cert_cn={cn} agent_id={agent_id_from_hello}")
+
+        agent_cert_fp = cert_fingerprint_hex(agent_cert)
 
         while True:
             # Receive Noise-encrypted envelope
@@ -99,6 +123,10 @@ async def handle_client(
                 raise ValueError("Missing session_id (required for channel binding)")
             if env.session_id != expected_session_id:
                 raise ValueError("Session binding mismatch")
+
+            # Optional: make sure agent_id matches hello identity
+            if env.agent_id != agent_id_from_hello:
+                raise ValueError("Agent identity mismatch (env.agent_id != session_hello agent_id)")
 
             # ---- decrypt record payload (AES-GCM) ----
             if env.enc_alg != "aes-256-gcm":
@@ -182,9 +210,11 @@ async def handle_client(
             stored_obj = env.model_dump()
             stored_obj["record"] = record.model_dump()
             stored_obj["server_received_at"] = utc_now_iso()
-            stored_obj["integrity_status"] = "verified_noise_xx_bound_hash_sig_aesgcm"
+            stored_obj["integrity_status"] = "verified_pki_noise_xx_bound_hash_sig_aesgcm"
+            stored_obj["agent_cert_fp"] = agent_cert_fp
 
             path = append_jsonl(cfg.storage_dir, cfg.log_file, stored_obj)
+
             # Non-authoritative indexing (optional)
             if not hasattr(handle_client, "_os_indexer"):
                 from pksl.indexing.opensearch_indexer import OpenSearchIndexer
@@ -192,12 +222,13 @@ async def handle_client(
                 handle_client._os_indexer.ensure_index()         # type: ignore[attr-defined]
 
             handle_client._os_indexer.index_log(stored_obj)      # type: ignore[attr-defined]
+
             ack = {
                 "ok": True,
                 "stored_to": path,
                 "seq": env.seq,
                 "agent_id": env.agent_id,
-                "integrity_status": "verified_noise_xx_bound_hash_sig_aesgcm",
+                "integrity_status": "verified_pki_noise_xx_bound_hash_sig_aesgcm",
             }
 
             ack_plain = json.dumps(ack).encode("utf-8")
@@ -230,7 +261,7 @@ async def main() -> None:
 
     print(
         f"[server] state={spath} | agents_tracked={len(state.last_seq)} | "
-        f"storage={cfg.storage_dir}/{cfg.log_file} | transport=Noise_XX(auth+bound) | enc=aes-256-gcm"
+        f"storage={cfg.storage_dir}/{cfg.log_file} | transport=Noise_XX(auth+bound+pki) | enc=aes-256-gcm"
     )
 
     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:

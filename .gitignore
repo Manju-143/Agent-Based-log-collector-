@@ -41,3 +41,13 @@ keys/*_private.pem
 *.pem
 *.pfx
 *.p12
+
+# OpenSearch
+opensearch-data/
+
+# Docker
+*.env
+
+# Build
+dist/
+build/
