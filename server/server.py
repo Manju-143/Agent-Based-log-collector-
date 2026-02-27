@@ -5,19 +5,58 @@ import json
 import os
 
 from pksl.config import ServerConfig
-from pksl.models import Envelope
+from pksl.models import Envelope, LogRecord
 from pksl.storage.append_only import append_jsonl, utc_now_iso
 from pksl.transport.framing import recv_frame, send_frame
 from pksl.transport.tcp_async import start_tcp_server
-from pksl.crypto.hashchain import compute_log_hash, GENESIS
+from pksl.crypto.hashchain import compute_log_hash, GENESIS, canonical_json
+
+from pksl.crypto.signing import load_public_key_pem, verify_bytes
+from pksl.crypto.key_loader import load_aes_key
+from pksl.crypto.aead import decrypt_aesgcm
+
+from pksl.transport.noise_xx import (
+    noise_xx_handshake_responder,
+    noise_encrypt,
+    noise_decrypt,
+)
 
 from server.state_store import ServerState, load_server_state, save_server_state
 
 
 def state_path() -> str:
-    # Store under ./data so Docker/K8s can mount a volume there
     os.makedirs("./data", exist_ok=True)
     return os.path.join("./data", "server_state.json")
+
+
+def public_key_path_for(agent_id: str) -> str:
+    return os.path.join("keys", f"{agent_id}_ed25519_public.pem")
+
+
+def server_noise_static_private_path() -> str:
+    return os.path.join("keys", "server_noise_private.key")
+
+
+def signing_message_with_record_fields(
+    *,
+    version: int,
+    agent_id: str,
+    seq: int,
+    prev_hash: str,
+    hash_hex: str,
+    session_id: str,
+    record_dict: dict,
+) -> bytes:
+    to_sign = {
+        "v": version,
+        "agent_id": agent_id,
+        "seq": seq,
+        "prev_hash": prev_hash,
+        "hash": hash_hex,
+        "session_id": session_id,
+        "record": record_dict,
+    }
+    return canonical_json(to_sign)
 
 
 async def handle_client(
@@ -26,15 +65,61 @@ async def handle_client(
     cfg: ServerConfig,
     state: ServerState,
     state_file: str,
+    aes_key: bytes,
 ) -> None:
     peer = writer.get_extra_info("peername")
     try:
+        # Noise handshake (responder) with static key (auth transport)
+        noise = await noise_xx_handshake_responder(
+            reader,
+            writer,
+            static_private_key_path=server_noise_static_private_path(),
+        )
+
+        # Channel binding: receive session_hello as FIRST encrypted frame
+        hello_wire = await recv_frame(reader)
+        hello_plain = noise_decrypt(noise, hello_wire)
+        hello = json.loads(hello_plain.decode("utf-8"))
+
+        if hello.get("type") != "session_hello" or not hello.get("session_id"):
+            raise ValueError("Missing/invalid session_hello for channel binding")
+
+        expected_session_id = hello["session_id"]
+
         while True:
-            data = await recv_frame(reader)
-            obj = json.loads(data.decode("utf-8"))
+            # Receive Noise-encrypted envelope
+            wire = await recv_frame(reader)
+            plain = noise_decrypt(noise, wire)
+
+            obj = json.loads(plain.decode("utf-8"))
             env = Envelope.model_validate(obj)
 
-            # ---- replay protection: sequence must strictly increase ----
+            # ---- session binding check ----
+            if not env.session_id:
+                raise ValueError("Missing session_id (required for channel binding)")
+            if env.session_id != expected_session_id:
+                raise ValueError("Session binding mismatch")
+
+            # ---- decrypt record payload (AES-GCM) ----
+            if env.enc_alg != "aes-256-gcm":
+                raise ValueError("Unsupported or missing enc_alg (expected aes-256-gcm)")
+            if not env.nonce or not env.ciphertext:
+                raise ValueError("Missing nonce/ciphertext for encrypted payload")
+
+            aad = canonical_json(
+                {
+                    "agent_id": env.agent_id,
+                    "seq": env.seq,
+                    "prev_hash": env.prev_hash,
+                    "hash": env.hash,
+                    "v": env.version,
+                }
+            )
+            plaintext = decrypt_aesgcm(aes_key, env.nonce, env.ciphertext, aad)
+            record_dict = json.loads(plaintext.decode("utf-8"))
+            record = LogRecord.model_validate(record_dict)
+
+            # ---- replay protection ----
             prev_seen_seq = state.last_seq.get(env.agent_id, 0)
             if env.seq <= prev_seen_seq:
                 raise ValueError(
@@ -55,40 +140,81 @@ async def handle_client(
                 agent_id=env.agent_id,
                 seq=env.seq,
                 prev_hash=env.prev_hash,
-                record_dict=env.record.model_dump(),
+                record_dict=record.model_dump(),
                 version=env.version,
             )
             if env.hash != expected_hash:
                 raise ValueError(f"Hash mismatch: agent={env.agent_id} seq={env.seq}")
 
-            # Update state only after validation
+            # ---- signature verification ----
+            if env.sig_alg != "ed25519":
+                raise ValueError("Unsupported or missing sig_alg (expected ed25519)")
+            if not env.signature or not env.key_id:
+                raise ValueError("Missing signature or key_id")
+
+            pub_path = public_key_path_for(env.key_id)
+            if not os.path.exists(pub_path):
+                raise FileNotFoundError(f"Missing public key for agent '{env.key_id}': {pub_path}")
+
+            pub = load_public_key_pem(pub_path)
+            ok = verify_bytes(
+                pub,
+                signing_message_with_record_fields(
+                    version=env.version,
+                    agent_id=env.agent_id,
+                    seq=env.seq,
+                    prev_hash=env.prev_hash,
+                    hash_hex=env.hash,
+                    session_id=env.session_id,
+                    record_dict=record.model_dump(),
+                ),
+                env.signature,
+            )
+            if not ok:
+                raise ValueError(f"Invalid signature: agent={env.agent_id} key_id={env.key_id} seq={env.seq}")
+
+            # ---- update & persist server state ----
             state.last_seq[env.agent_id] = env.seq
             state.last_hash[env.agent_id] = env.hash
-
-            # Persist state so server restarts won't break chain
             save_server_state(state_file, state)
 
+            # ---- store ----
             stored_obj = env.model_dump()
+            stored_obj["record"] = record.model_dump()
             stored_obj["server_received_at"] = utc_now_iso()
-            stored_obj["integrity_status"] = "verified_hashchain"
+            stored_obj["integrity_status"] = "verified_noise_xx_bound_hash_sig_aesgcm"
 
             path = append_jsonl(cfg.storage_dir, cfg.log_file, stored_obj)
+            # Non-authoritative indexing (optional)
+            if not hasattr(handle_client, "_os_indexer"):
+                from pksl.indexing.opensearch_indexer import OpenSearchIndexer
+                handle_client._os_indexer = OpenSearchIndexer()  # type: ignore[attr-defined]
+                handle_client._os_indexer.ensure_index()         # type: ignore[attr-defined]
 
+            handle_client._os_indexer.index_log(stored_obj)      # type: ignore[attr-defined]
             ack = {
                 "ok": True,
                 "stored_to": path,
                 "seq": env.seq,
                 "agent_id": env.agent_id,
-                "integrity_status": "verified_hashchain",
+                "integrity_status": "verified_noise_xx_bound_hash_sig_aesgcm",
             }
-            await send_frame(writer, json.dumps(ack).encode("utf-8"))
+
+            ack_plain = json.dumps(ack).encode("utf-8")
+            ack_wire = noise_encrypt(noise, ack_plain)
+            await send_frame(writer, ack_wire)
 
     except asyncio.IncompleteReadError:
         pass
     except Exception as e:
         err = {"ok": False, "error": str(e), "peer": str(peer)}
         try:
-            await send_frame(writer, json.dumps(err).encode("utf-8"))
+            err_plain = json.dumps(err).encode("utf-8")
+            try:
+                err_wire = noise_encrypt(noise, err_plain)  # type: ignore[name-defined]
+                await send_frame(writer, err_wire)
+            except Exception:
+                await send_frame(writer, err_plain)
         except Exception:
             pass
     finally:
@@ -98,17 +224,17 @@ async def handle_client(
 
 async def main() -> None:
     cfg = ServerConfig.from_env()
-
     spath = state_path()
     state = load_server_state(spath)
+    aes_key = load_aes_key()
 
     print(
         f"[server] state={spath} | agents_tracked={len(state.last_seq)} | "
-        f"storage={cfg.storage_dir}/{cfg.log_file}"
+        f"storage={cfg.storage_dir}/{cfg.log_file} | transport=Noise_XX(auth+bound) | enc=aes-256-gcm"
     )
 
     async def _handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await handle_client(r, w, cfg, state, spath)
+        await handle_client(r, w, cfg, state, spath, aes_key)
 
     server = await start_tcp_server(cfg.host, cfg.port, _handler)
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])

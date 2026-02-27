@@ -16,11 +16,23 @@ class Envelope(BaseModel):
     version: int = 1
     agent_id: str
     seq: int
-    record: LogRecord
 
-    # Future crypto fields (we’ll fill later)
+    # Session binding (Noise transcript hash, base64)
+    session_id: Optional[str] = None
+
+    # When encryption is enabled, we will send ciphertext+nonce and set record=None.
+    record: Optional[LogRecord] = None
+
+    # Hash chain (integrity)
     prev_hash: Optional[str] = None
     hash: Optional[str] = None
+
+    # Signature (authenticity)
+    sig_alg: Optional[str] = None
+    key_id: Optional[str] = None
     signature: Optional[str] = None
-    ciphertext: Optional[str] = None
-    nonce: Optional[str] = None
+
+    # Encryption (confidentiality)
+    enc_alg: Optional[str] = None          # e.g., "aes-256-gcm"
+    nonce: Optional[str] = None            # base64
+    ciphertext: Optional[str] = None       # base64

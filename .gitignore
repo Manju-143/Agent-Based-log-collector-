@@ -3,20 +3,41 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.log
+*.egg-info/
+dist/
+build/
 
-# Virtual env
+# Virtual Virtual env
 .venv/
+venv/
 
-# Local data
+# Local data those logs
 data/
 *.jsonl
+data/
+*.log
 
 # VS Code
 .vscode/
 
-# OS files
+# OS files are not included
 .DS_Store
 Thumbs.db
 #to ignore keys in git
 keys/*_private.pem
+#to remove env aes secret in git
+.env 
+# private keys are hidden but public key can be seen in git
+keys/*_private.pem
+keys/*_noise_private.key
+.env
+.env.*
+!.env.manju
+pki/ca/ca_key.pem
+pki/issued/*_key.pem
+keys/*_private.pem
+
+*.key
+*.pem
+*.pfx
+*.p12
