@@ -10,7 +10,7 @@ Observability
 
 Optional integration with OpenSearch enables log indexing and analytics. This provides SIEM-style visibility and supports monitoring, alerting, and visualization of security events.
 
-Architecture
+## Architecture
 
 The system consists of the following components:
 
@@ -27,7 +27,7 @@ Optional search and visualization layer
 The workflow follows this sequence:
 Agents generate logs, encrypt them, digitally sign the records, and transmit them securely to the central server. The server verifies authenticity and integrity, stores the records in an append-only format, and optionally indexes them for analytics.
 
-Setup
+## Setup
 1. Install dependencies
 python -m venv .venv
 .venv\Scripts\activate
@@ -45,30 +45,30 @@ Tamper detection
 
 To test tamper detection, modify any record in:
 
-data/verified_logs.jsonl
+## data/verified_logs.jsonl
 
 Then run:
 
-python -m tools.verify_logfile
+## python -m tools.verify_logfile
 
 The system will identify the modification and report a verification failure.
 
-Certificate revocation
+## Certificate revocation
 
 Revoke an agent certificate and restart the server. The revoked agent will no longer be able to authenticate or transmit logs.
 
 OpenSearch Integration (Optional)
 
-To enable log analytics:
+## To enable log analytics:
 
 docker compose up -d
 
-Dashboards can be accessed at:
+## Dashboards can be accessed at:
 
 http://localhost:5601
 Security Objectives
 
-This system is designed to protect against the following threats:
+## This system is designed to protect against the following threats:
 
 Log tampering
 
@@ -80,7 +80,7 @@ Agent impersonation
 
 Unauthorized modification of stored records
 
-Technologies
+## Technologies
 
 Python
 
@@ -96,7 +96,7 @@ PKI and CRL
 
 OpenSearch
 
-Disclaimer
+## Disclaimer
 
 This project is intended for academic and research purposes only. It demonstrates secure design concepts and is not intended to replace production-grade security solutions without further hardening and validation.
 
