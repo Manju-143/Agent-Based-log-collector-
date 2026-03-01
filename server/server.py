@@ -19,13 +19,13 @@ from pksl.transport.noise_xx import (
     noise_decrypt,
 )
 
-#from pksl.crypto.pki import (
- #   load_cert_from_b64_pem,
-  #  validate_cert_path,
-    #cert_fingerprint_hex,
-    #cert_subject_cn,
-#)
-from pksl.crypto.pki import load_cert_from_b64_pem, validate_cert, cert_fingerprint_hex, cert_subject_cn
+from pksl.crypto.pki import (
+    load_cert_from_b64_pem,
+    validate_cert,
+    cert_fingerprint_hex,
+    cert_subject_cn,
+)
+
 from server.state_store import ServerState, load_server_state, save_server_state
 
 
@@ -73,6 +73,8 @@ async def handle_client(
     aes_key: bytes,
 ) -> None:
     peer = writer.get_extra_info("peername")
+    noise = None  # important: avoid NameError if handshake fails
+
     try:
         # Noise handshake (responder) with static key (auth transport)
         noise = await noise_xx_handshake_responder(
@@ -91,7 +93,7 @@ async def handle_client(
 
         expected_session_id = str(hello["session_id"])
 
-        # --- PKI: validate agent certificate from hello (NO hello-ack sent; keep agent compatible) ---
+        # --- PKI: validate agent certificate from hello ---
         agent_id_from_hello = str(hello.get("agent_id", ""))
         agent_cert_b64 = str(hello.get("agent_cert_b64", ""))
 
@@ -128,6 +130,24 @@ async def handle_client(
             if env.agent_id != agent_id_from_hello:
                 raise ValueError("Agent identity mismatch (env.agent_id != session_hello agent_id)")
 
+            # ---- replay protection (DO THIS EARLY) ----
+            prev_seen_seq = state.last_seq.get(env.agent_id, 0)
+            if env.seq <= prev_seen_seq:
+                raise ValueError(
+                    f"Replay detected: agent={env.agent_id} seq={env.seq} last_seq={prev_seen_seq}"
+                )
+
+            # ---- hash chain fields present ----
+            if not env.hash or not env.prev_hash:
+                raise ValueError("Missing hash chain fields (hash/prev_hash)")
+
+            # ---- hash chain continuity check (also early) ----
+            expected_prev = state.last_hash.get(env.agent_id, GENESIS)
+            if env.prev_hash != expected_prev:
+                raise ValueError(
+                    f"Hash chain break: agent={env.agent_id} expected_prev={expected_prev} got_prev={env.prev_hash}"
+                )
+
             # ---- decrypt record payload (AES-GCM) ----
             if env.enc_alg != "aes-256-gcm":
                 raise ValueError("Unsupported or missing enc_alg (expected aes-256-gcm)")
@@ -147,23 +167,7 @@ async def handle_client(
             record_dict = json.loads(plaintext.decode("utf-8"))
             record = LogRecord.model_validate(record_dict)
 
-            # ---- replay protection ----
-            prev_seen_seq = state.last_seq.get(env.agent_id, 0)
-            if env.seq <= prev_seen_seq:
-                raise ValueError(
-                    f"Replay detected: agent={env.agent_id} seq={env.seq} last_seq={prev_seen_seq}"
-                )
-
-            # ---- hash chain validation ----
-            if not env.hash or not env.prev_hash:
-                raise ValueError("Missing hash chain fields (hash/prev_hash)")
-
-            expected_prev = state.last_hash.get(env.agent_id, GENESIS)
-            if env.prev_hash != expected_prev:
-                raise ValueError(
-                    f"Hash chain break: agent={env.agent_id} expected_prev={expected_prev} got_prev={env.prev_hash}"
-                )
-
+            # ---- hash correctness check ----
             expected_hash = compute_log_hash(
                 agent_id=env.agent_id,
                 seq=env.seq,
@@ -201,12 +205,12 @@ async def handle_client(
             if not ok:
                 raise ValueError(f"Invalid signature: agent={env.agent_id} key_id={env.key_id} seq={env.seq}")
 
-            # ---- update & persist server state ----
+            # ---- update & persist server state (ONLY after accept) ----
             state.last_seq[env.agent_id] = env.seq
             state.last_hash[env.agent_id] = env.hash
             save_server_state(state_file, state)
 
-            # ---- store ----
+            # ---- store verified log ----
             stored_obj = env.model_dump()
             stored_obj["record"] = record.model_dump()
             stored_obj["server_received_at"] = utc_now_iso()
@@ -241,10 +245,11 @@ async def handle_client(
         err = {"ok": False, "error": str(e), "peer": str(peer)}
         try:
             err_plain = json.dumps(err).encode("utf-8")
-            try:
-                err_wire = noise_encrypt(noise, err_plain)  # type: ignore[name-defined]
+            if noise is not None:
+                err_wire = noise_encrypt(noise, err_plain)
                 await send_frame(writer, err_wire)
-            except Exception:
+            else:
+                # handshake failed; best-effort plain error
                 await send_frame(writer, err_plain)
         except Exception:
             pass
