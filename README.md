@@ -1,121 +1,273 @@
-Public Key Infrastructure (PKI)
+## Agent-Based Secure Cryptographic Logging System (PKSL)
 
-The system supports certificate-based authentication of agents using X.509 certificates. It includes certificate validation and Certificate Revocation List (CRL) functionality, allowing compromised or unauthorized agents to be revoked and blocked.
+### Overview
 
-Integrity and Detection
+PKSL is a secure, agent-based cryptographic logging framework designed to provide tamper-evident, encrypted, and authenticated log collection in zero-trust environments. The system demonstrates a defence-in-depth approach by combining modern cryptographic mechanisms across identity, transport, storage, and verification layers.
 
-An append-only storage model is used to preserve log integrity. Tamper detection and verification tools are provided to independently validate stored logs. Any alteration in the log chain is immediately detectable.
+This prototype was developed to demonstrate a secure logging architecture suitable for Security Operations Centres (SOC), SIEM platforms, cloud-native applications, and distributed infrastructure. The focus is on protecting log integrity from generation to long-term storage while supporting secure monitoring and forensic analysis.
 
-Observability
+---
 
-Optional integration with OpenSearch enables log indexing and analytics. This provides SIEM-style visibility and supports monitoring, alerting, and visualization of security events.
+### Key Security Objectives
 
-## Architecture
+The system aims to:
 
-The system consists of the following components:
+1. Ensure log integrity and detect tampering.
+2. Protect confidentiality using authenticated encryption.
+3. Prevent replay and cross-session attacks.
+4. Establish secure communication and identity validation.
+5. Support secure indexing without trusting the indexing layer.
+6. Demonstrate practical and real-world cryptographic system design.
 
-Secure log agents
+---
 
-Central verification server
+### Security Architecture
 
-PKI trust infrastructure
+PKSL integrates multiple cryptographic controls:
 
-Tamper-evident storage
+#### Identity and Trust
 
-Optional search and visualization layer
+* Public Key Infrastructure (PKI)
+* ECDSA P-256 Certificate Authority
+* Agent certificate issuance
+* Certificate Revocation List (CRL) validation
 
-The workflow follows this sequence:
-Agents generate logs, encrypt them, digitally sign the records, and transmit them securely to the central server. The server verifies authenticity and integrity, stores the records in an append-only format, and optionally indexes them for analytics.
+#### Secure Transport
 
-## Setup
-1. Install dependencies
+* Noise Protocol Framework (Noise_XX pattern)
+* Mutual authentication using static keys
+* Forward secrecy and session binding
+
+#### Integrity and Tamper Detection
+
+* SHA-256 hash chaining
+* Append-only log storage
+* Independent integrity verification tool
+
+#### Authentication and Non-Repudiation
+
+* Ed25519 digital signatures
+
+---
+
+### Project Structure
+
+```
+agent/
+server/
+pksl/
+tools/
+keys/
+pki/
+data/
+docker-compose.opensearch.yml
+requirements.txt
+README.md
+```
+
+---
+
+### Installation and Setup
+
+#### Step 1: Clone the repository
+
+```
+git clone <your_repo_url>
+cd project
+```
+
+#### Step 2: Create a virtual environment
+
+```
 python -m venv .venv
 .venv\Scripts\activate
+```
+
+#### Step 3: Install dependencies
+
+```
 pip install -r requirements.txt
-2. Generate cryptographic keys
-python -m tools.gen_keys
-3. Set encryption key
-$env:PKSL_AES_KEY="YOUR_BASE64_AES_KEY"
-4. Start the server
+```
+
+---
+
+### Cryptographic Key and PKI Setup
+
+The system includes an automated wizard for key and certificate generation.
+
+Run:
+
+```
+python tools\pki_wizard.py
+```
+
+This tool supports:
+
+* AES-256 key generation
+* Certificate Authority creation
+* Agent certificate issuance
+* Ed25519 signing key generation
+* Noise static key generation
+* Certificate revocation
+* CRL updates
+
+Recommended workflow:
+
+1. Create the Certificate Authority.
+2. Generate agent signing keys.
+3. Generate Noise static keys.
+4. Issue agent certificates.
+5. Generate AES encryption keys.
+
+---
+
+### Environment Configuration
+
+Set encryption key:
+
+```
+$env:PKSL_AES_KEY="your_base64_key"
+```
+
+Set agent certificate:
+
+```
+$env:PKSL_AGENT_CERT="pki/issued/agent-01_cert.pem"
+```
+
+---
+
+### Running the System
+
+#### Start the server
+
+```
+.venv\Scripts\activate
 python -m server.server
-5. Run the agent
+```
+
+#### Start the agent (new terminal)
+
+```
+.venv\Scripts\activate
 python -m agent.agent
-Verification and Tamper Testing
-Tamper detection
+```
 
-To test tamper detection, modify any record in:
+The agent will:
 
-## data/verified_logs.jsonl
+* Establish a secure Noise session
+* Encrypt and sign log records
+* Transmit logs continuously
+* Maintain persistent state
 
-Then run:
+---
 
-## python -m tools.verify_logfile
+### Verifying Log Integrity
 
-The system will identify the modification and report a verification failure.
+Stop the agent and run:
 
-## Certificate revocation
+```
+python -m tools.verify_logfile
+```
 
-Revoke an agent certificate and restart the server. The revoked agent will no longer be able to authenticate or transmit logs.
+The verification tool checks:
 
-OpenSearch Integration (Optional)
+* Hash chain integrity
+* Signature correctness
+* Replay protection
+* Tamper detection
 
-## To enable log analytics:
+This demonstrates independent forensic validation.
 
-docker compose up -d
+---
 
-## Dashboards can be accessed at:
+### OpenSearch Integration
 
+The system supports secure indexing for monitoring and analytics.
+
+Start OpenSearch:
+
+```
+docker compose -f docker-compose.opensearch.yml up -d
+```
+
+Access the dashboard:
+
+```
 http://localhost:5601
-Security Objectives
-
-## This system is designed to protect against the following threats:
-
-Log tampering
-
-Replay attacks
-
-Man-in-the-middle interception
-
-Agent impersonation
-
-Unauthorized modification of stored records
-
-## Technologies
-
-Python
-
-Noise Protocol
-
-Ed25519
-
-AES-GCM
-
-SHA-256
-
-PKI and CRL
-
-OpenSearch
-
-## Disclaimer
-
-This project is intended for academic and research purposes only. It demonstrates secure design concepts and is not intended to replace production-grade security solutions without further hardening and validation.
-
-## Run locally (PowerShell)
-
-### Server
-```powershell
-.venv\Scripts\Activate
-$env:PKSL_STORAGE_DIR=".\data"
-$env:PKSL_SERVER_HOST="127.0.0.1"
-$env:PKSL_SERVER_PORT="9000"
-python -m server.server
 ```
 
-### Agent
-```powershell
-.venv\Scripts\Activate
-$env:PKSL_AGENT_ID="agent-01"
-$env:PKSL_TARGET_HOST="127.0.0.1"
-$env:PKSL_TARGET_PORT="9000"
-python -m agent.agent
+Create index pattern:
+
 ```
+pksl-logs
+```
+
+The index is non-authoritative, meaning cryptographic integrity remains enforced locally.
+
+---
+
+### Threat Model and Security Benefits
+
+PKSL mitigates the following risks:
+
+* Log tampering and deletion
+* Replay and injection attacks
+* Insider manipulation
+* Network interception
+* Session hijacking
+* Certificate compromise
+* Data exposure in transit
+* Centralised logging trust weaknesses
+
+---
+
+### Demonstration Workflow
+
+A typical demonstration includes:
+
+1. Starting the server and agent.
+2. Showing encrypted and signed log transmission.
+3. Visualising logs in OpenSearch.
+4. Modifying logs manually.
+5. Running the verification tool.
+6. Demonstrating tamper detection.
+7. Revoking certificates and validating denial.
+
+---
+
+### Limitations
+
+This system is a research prototype and includes:
+
+* Single-node deployment
+* Simplified certificate lifecycle
+* No hardware security module integration
+* Limited scalability testing
+
+These provide scope for further research and development.
+
+---
+
+### Future Improvements
+
+* Kubernetes deployment
+* Hardware security module integration
+* Multi-tenant identity
+* Advanced zero-trust architecture
+* Secure key rotation
+* Distributed consensus storage
+* Automated threat detection
+
+---
+
+### Use Cases
+
+* SOC logging pipelines
+* Cloud security monitoring
+* Compliance and audit logging
+* Critical infrastructure protection
+* Financial and healthcare environments
+* Zero-trust systems
+
+---
