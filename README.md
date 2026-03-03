@@ -271,3 +271,71 @@ These provide scope for further research and development.
 * Zero-trust systems
 
 ---
+## Containerised Deployment (Docker)
+
+### Overview
+
+The Secure Cryptographic Logging System is fully containerised using Docker to ensure portability, reproducibility, and consistent runtime environments. The server and agent components are orchestrated using Docker Compose. Sensitive configuration is injected at runtime via environment variables rather than being embedded in source code or container images.
+
+---
+
+### Prerequisites
+
+- Docker Desktop installed and running  
+- Git installed  
+- Python (only required for PKI generation using the provided tools)
+
+---
+
+### Environment Configuration
+
+Create a `.env` file in the project root directory (this file must not be committed to version control):
+#.env
+PKSL_AES_KEY=<base64-encoded-32-byte-key>
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=<admin-password>
+
+
+#To generate a secure 256-bit AES key: python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+
+Copy the generated value into `PKSL_AES_KEY`.
+
+---
+
+### PKI Initialisation (One-Time Setup)
+
+If certificate material does not already exist, initialise the PKI using:
+#script for key generation
+python tools\pki_wizard.py
+
+Recommended steps:
+
+- Create CA (if not already created)  
+- Use the "Do ALL for an agent" option to generate:
+  - Ed25519 signing keys  
+  - Noise static keys  
+  - X.509 certificate signed by the CA  
+
+This ensures the agent can authenticate securely with the server.
+
+---
+
+### Build and Run Containers
+
+From the project root directory:
+
+docker compose up --build
+
+This will:
+
+- Build the Docker image  
+- Start the PKI server  
+- Start the agent  
+- Establish secure Noise transport  
+- Enforce certificate validation and replay protection  
+
+---
+
+### Stopping the System
+
+To stop all services:
+docker compose down
